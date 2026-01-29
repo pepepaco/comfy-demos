@@ -176,11 +176,11 @@ async def generate_handler(prompt, df_state, selected_index):
     df_state.at[idx, 'last_prompt'] = prompt  # El prompt actual se guarda como last_prompt
     # df_state.at[idx, 'new_prompt'] se mantiene como original_new_prompt
 
-    # 2. Insertar la nueva imagen en la siguiente posición
+    # 2. Insertar la nueva imagen EN LA POSICIÓN ACTUAL (en lugar de después de la imagen original)
     # - su last_prompt es el prompt actual (porque se usó para generarla)
     # - su new_prompt también es el prompt actual
     new_row = pd.DataFrame({'path': [new_img], 'last_prompt': [prompt], 'new_prompt': [prompt]})
-    df_state = pd.concat([df_state.iloc[:idx+1], new_row, df_state.iloc[idx+1:]]).reset_index(drop=True)
+    df_state = pd.concat([df_state.iloc[:idx], new_row, df_state.iloc[idx:]]).reset_index(drop=True)
 
     # Convertir el dataframe a la lista que necesita la galería
     gallery_list = []
@@ -194,13 +194,20 @@ async def generate_handler(prompt, df_state, selected_index):
 
     # Devolver el dataframe actualizado, la lista para la galería,
     # el last_prompt de la imagen original al cuadro de texto (si no está vacío, si está vacío se limpia)
+    # y el índice de la nueva imagen para que se seleccione automáticamente
     current_last_prompt = df_state.iloc[idx]['last_prompt']
     if current_last_prompt and current_last_prompt.strip():
         input_prompt = current_last_prompt
     else:
         input_prompt = ""
 
-    return df_state, gallery_list, input_prompt, selected_index
+    # Devolver el índice de la nueva imagen (que es idx porque se insertó en la posición actual)
+    new_image_index = idx
+
+    # Devolver el dataframe actualizado, la galería actualizada con la nueva imagen,
+    # el input actualizado con el last_prompt y el índice de la nueva imagen
+    # Forcing the gallery to update with the new selected index
+    return df_state, gr.Gallery(value=gallery_list, selected_index=new_image_index, visible=True), input_prompt, new_image_index
 
 def handle_upload(files, df_state):
     # Actualiza el estado con los archivos subidos
@@ -262,6 +269,7 @@ with gr.Blocks(title="Nunchaku Pro Mobile") as demo:
             preview=True,
             interactive=True,
             object_fit="contain",
+            selected_index=0,
         )
 
         btn_send = gr.Button("🚀 GENERAR EDICIÓN", variant="primary", size="lg")

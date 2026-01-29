@@ -1,0 +1,14 @@
+name: comfyui-env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - gradio==6.3.0 # Versión estable recomendada para evitar bugs de UI
+      - requests # Para las peticiones HTTP (upload/prompt)
+      - aiohttp # Necesario para la conexión por WebSockets
+      - pillow # Para el manejo de imágenes
+      - numpy # Para el manejo de arrays
+      - pandas # Para el manejo de DataFrames

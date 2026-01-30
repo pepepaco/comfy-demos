@@ -6,7 +6,6 @@ import aiohttp
 import uuid
 import tempfile
 import os
-import pandas as pd
 
 # Configuración centralizada
 class AppConfig:
@@ -25,10 +24,9 @@ class AppConfig:
 # Caché para el flujo de trabajo
 _workflow_cache = None
 
-# DataFrame para almacenar la información de las imágenes
-def initialize_dataframe():
-    df = pd.DataFrame(columns=['path', 'last_prompt', 'new_prompt'])
-    return df
+# Lista para almacenar la información de las imágenes
+def initialize_image_list():
+    return []
 
 async def process_image(prompt_text, source_path):
     global _workflow_cache
@@ -141,84 +139,75 @@ async def process_image(prompt_text, source_path):
     else:
         raise Exception("No output images found in workflow result")
 
-async def generate_handler(prompt, df_state, selected_index):
-    # Si no hay dataframe o está vacío, retornar error
-    if df_state is None or df_state.empty:
-        return df_state, [], "⚠️ Sube o selecciona una imagen primero.", selected_index
+async def generate_handler(prompt, image_list, selected_index):
+    # Si no hay lista de imágenes o está vacía, retornar error
+    if image_list is None or len(image_list) == 0:
+        return image_list, [], "⚠️ Sube o selecciona una imagen primero.", selected_index
 
     # Determinar el índice a usar
-    if selected_index is not None and 0 <= selected_index < len(df_state):
+    if selected_index is not None and 0 <= selected_index < len(image_list):
         idx = selected_index
     else:
-        idx = len(df_state) - 1
+        idx = len(image_list) - 1
 
-    # Obtener el last_prompt de la imagen original (si existe)
-    previous_last_prompt = df_state.iloc[idx]['last_prompt'] if 'last_prompt' in df_state.columns else ""
-
-    # Obtener la ruta de la imagen original
-    original_path = df_state.iloc[idx]['path']
+    # Obtener la información de la imagen original
+    original_item = image_list[idx]
+    original_path = original_item['path']
 
     # Asegurarse de que original_path es una cadena y no una tupla
     if isinstance(original_path, tuple):
         original_path = original_path[0]
 
     if not original_path:
-        return df_state, [], "⚠️ Sube o selecciona una imagen primero.", selected_index
+        return image_list, [], "⚠️ Sube o selecciona una imagen primero.", selected_index
 
     # Procesar la imagen con el prompt actual
     new_img = await process_image(prompt, original_path)
 
-    # Actualizar el dataframe
+    # Actualizar la lista de imágenes
     # 1. Actualizar la imagen original:
     # - su last_prompt ahora es el prompt actual (porque se usó para generar la nueva imagen)
-    # - su new_prompt se mantiene igual
-    original_new_prompt = df_state.iloc[idx]['new_prompt']
-    df_state.at[idx, 'last_prompt'] = prompt  # El prompt actual se guarda como last_prompt
-    # df_state.at[idx, 'new_prompt'] se mantiene como original_new_prompt
+    original_item['last_prompt'] = prompt
 
     # 2. Insertar la nueva imagen EN LA POSICIÓN ACTUAL (en lugar de después de la imagen original)
     # - su last_prompt es el prompt actual (porque se usó para generarla)
     # - su new_prompt también es el prompt actual
-    new_row = pd.DataFrame({'path': [new_img], 'last_prompt': [prompt], 'new_prompt': [prompt]})
-    df_state = pd.concat([df_state.iloc[:idx], new_row, df_state.iloc[idx:]]).reset_index(drop=True)
+    new_item = {'path': new_img, 'last_prompt': prompt, 'new_prompt': prompt}
+    image_list.insert(idx, new_item)
 
-    # Convertir el dataframe a la lista que necesita la galería
+    # Convertir la lista a la que necesita la galería
     gallery_list = []
-    for _, row in df_state.iterrows():
-        path = row['path']
+    for item in image_list:
+        path = item['path']
         # Asegurarse de que el path es una cadena
         if isinstance(path, tuple):
             path = path[0]
         # La etiqueta de la imagen debe mostrar el new_prompt
-        gallery_list.append((path, row['new_prompt']))
+        gallery_list.append((path, item['new_prompt']))
 
-    # Devolver el dataframe actualizado, la lista para la galería,
-    # el last_prompt de la imagen original al cuadro de texto (si no está vacío, si está vacío se limpia)
+    # Devolver la lista actualizada, la lista para la galería,
     # y el índice de la nueva imagen para que se seleccione automáticamente
-    current_last_prompt = df_state.iloc[idx]['last_prompt']
-    if current_last_prompt and current_last_prompt.strip():
-        input_prompt = current_last_prompt
-    else:
-        input_prompt = ""
+    # Mantener el prompt actual en el input textbox
+    input_prompt = prompt
 
     # Devolver el índice de la nueva imagen (que es idx porque se insertó en la posición actual)
     new_image_index = idx
 
-    # Devolver el dataframe actualizado, la galería actualizada con la nueva imagen,
-    # el input actualizado con el last_prompt y el índice de la nueva imagen
+    # Devolver la lista actualizada, la galería actualizada con la nueva imagen,
+    # el input manteniendo el último prompt usado y el índice de la nueva imagen
     # Forcing the gallery to update with the new selected index
-    return df_state, gr.Gallery(value=gallery_list, selected_index=new_image_index, visible=True), input_prompt, new_image_index
+    return image_list, gr.Gallery(value=gallery_list, selected_index=new_image_index, visible=True), input_prompt, new_image_index
 
-def handle_upload(files, df_state):
+def handle_upload(files, image_list):
     # Actualiza el estado con los archivos subidos
     if files is None:
-        return df_state
+        return image_list
 
-    # Si no hay dataframe, inicializar uno
-    if df_state is None or df_state.empty:
-        df_state = initialize_dataframe()
+    # Si no hay lista de imágenes, inicializar una
+    if image_list is None:
+        image_list = initialize_image_list()
 
-    # Agregar las nuevas imágenes al dataframe
+    # Agregar las nuevas imágenes a la lista
     for item in files:
         # Asegurarse de que file_path es solo la ruta, no una tupla
         if isinstance(item, tuple):
@@ -226,37 +215,26 @@ def handle_upload(files, df_state):
         else:
             file_path = item  # Si no es tupla, usar directamente
 
-        new_row = pd.DataFrame({
-            'path': [file_path],
-            'last_prompt': [""],
-            'new_prompt': [""]
-        })
-        df_state = pd.concat([df_state, new_row], ignore_index=True)
+        new_item = {
+            'path': file_path,
+            'last_prompt': "",
+            'new_prompt': ""
+        }
+        image_list.append(new_item)
 
-    return df_state
+    return image_list
 
-def on_select(evt: gr.SelectData, df_state):
+def on_select(evt: gr.SelectData, image_list):
     idx = evt.index
-    text_update = gr.update()
-
-    if df_state is not None and not df_state.empty and 0 <= idx < len(df_state):
-        # Obtener la fila correspondiente
-        row = df_state.iloc[idx]
-
-        # El input debe mostrar el last_prompt si no está vacío, si está vacío debe limpiarse
-        last_prompt = row['last_prompt'] if 'last_prompt' in row else ""
-
-        if last_prompt and last_prompt.strip():
-            text_update = last_prompt
-        else:
-            # Si el last_prompt está vacío, limpiar el input
-            text_update = ""
+    # No actualizar el input textbox cuando se selecciona una imagen
+    # El input textbox debe mantener siempre el último prompt usado
+    text_update = gr.update()  # Esto mantiene el valor actual del textbox
 
     return idx, text_update
 
 with gr.Blocks(title="Nunchaku Pro Mobile") as demo:
-    # Estado para mantener el DataFrame con la información de las imágenes
-    df_state = gr.State(lambda: initialize_dataframe())
+    # Estado para mantener la lista con la información de las imágenes
+    image_list = gr.State(lambda: initialize_image_list())
     selected_index = gr.State(None)
 
     gr.Markdown("# 🎨 Nunchaku Qwen Editor")
@@ -282,14 +260,14 @@ with gr.Blocks(title="Nunchaku Pro Mobile") as demo:
 
     # Eventos
     # Al subir archivos, actualizamos el estado interno
-    gallery.upload(handle_upload, [gallery, df_state], [df_state])
+    gallery.upload(handle_upload, [gallery, image_list], [image_list])
 
     # Al presionar Enter o Clic en Generar
-    msg_input.submit(generate_handler, [msg_input, df_state, selected_index], [df_state, gallery, msg_input, selected_index])
-    btn_send.click(generate_handler, [msg_input, df_state, selected_index], [df_state, gallery, msg_input, selected_index])
+    msg_input.submit(generate_handler, [msg_input, image_list, selected_index], [image_list, gallery, msg_input, selected_index])
+    btn_send.click(generate_handler, [msg_input, image_list, selected_index], [image_list, gallery, msg_input, selected_index])
 
     # Guardar selección al tocar
-    gallery.select(on_select, df_state, [selected_index, msg_input])
+    gallery.select(on_select, image_list, [selected_index, msg_input])
 
 if __name__ == "__main__":
     print("[STARTING] Iniciando servidor Gradio...")

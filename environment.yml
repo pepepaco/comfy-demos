@@ -11,4 +11,3 @@ dependencies:
       - aiohttp # Necesario para la conexión por WebSockets
       - pillow # Para el manejo de imágenes
       - numpy # Para el manejo de arrays
-      - pandas # Para el manejo de DataFrames

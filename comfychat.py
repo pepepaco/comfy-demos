@@ -127,16 +127,30 @@ async def chat_fn(message, history):
 
     # Store original image in chat history for reference/reuse
     if src_path:
-        history.append({"role": "user", "content": gr.Image(src_path)})
+        history.append({
+            "role": "user",
+            "content": gr.Image(
+                src_path,
+                height=1300,                # Altura fija del preview
+   # Botón de descarga
+                container=False,               # Envuelve en contenedor con sombra
+            )
+        })
 
     try:
         local_img_path = await process_image(text, src_path)
 
         # Append user's text prompt and assistant's processed image
         history.append({"role": "user", "content": text})
-        history.append(
-            {"role": "assistant", "content": gr.Image(local_img_path)}
-        )
+        history.append({
+            "role": "assistant",
+            "content": gr.Image(
+                local_img_path,
+                height=1400,                # Preview más grande para resultados
+
+                container=False,
+            )
+        })
 
         return history, gr.update(value=None)
 
@@ -149,12 +163,15 @@ async def chat_fn(message, history):
 
 # ----------------------------------------------------
 # 3️⃣ UI – unchanged apart from using MultimodalTextbox
-with gr.Blocks() as demo:
+with gr.Blocks(fill_width=True, fill_height=True) as demo:
     gr.Markdown("## 💬 Nunchaku Qwen Chat")
 
     with gr.Row():
         with gr.Column(scale=2):
-            chatbot = gr.Chatbot(label="Chat", height=550)
+            chatbot = gr.Chatbot(
+                label="Chat",
+                height=600,              # Altura fija en píxeles para scroll
+            )
 
             chat_input = gr.MultimodalTextbox(
                 interactive=True,

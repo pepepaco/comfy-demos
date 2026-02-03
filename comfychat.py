@@ -104,11 +104,7 @@ Provide ONLY the final prompt in a single paragraph (80-120 words). No explanati
 "The woman in the blue dress walks forward with confident, steady steps, actively moving throughout the entire clip. Her legs move continuously, arms swing naturally, and the blue fabric flows with each stride as she moves along the garden path. A smooth tracking shot follows her forward motion from a medium angle, keeping her centered. Continuous, fluid walking motion sustained for the full duration, photorealistic quality, consistent lighting and identity throughout."
 """
 
-# Directorio persistente para medios generados (imágenes y videos)
-MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_media")
-os.makedirs(MEDIA_DIR, exist_ok=True)
-
-# Directorio temporal para procesamiento (evita que se borren antes de reproducir)
+# Directorio persistente para videos (evita que se borren antes de reproducir)
 OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "comfychat_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -116,103 +112,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 0️⃣ Set up a logger (mirrors the logger used in run.py)
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-# ----------------------------------------------------
-# 0️⃣ Persistencia del historial del chat
-# ----------------------------------------------------
-def save_chat_history(history):
-    """Guarda el historial del chat en un archivo JSON, usando URLs de ComfyUI para medios"""
-    try:
-        serializable_history = []
-        for msg in history:
-            if isinstance(msg, dict) and "role" in msg and "content" in msg:
-                content = msg["content"]
-                metadata = msg.get("metadata", {})
-                # Guardar mensajes de texto
-                if isinstance(content, str):
-                    serializable_history.append({
-                        "role": msg["role"],
-                        "content": content
-                    })
-                # Guardar URLs de ComfyUI para imágenes/videos (desde metadata)
-                elif metadata and metadata.get("comfy_url"):
-                    serializable_history.append({
-                        "role": msg["role"],
-                        "content": None,
-                        "comfy_url": metadata["comfy_url"],
-                        "media_type": metadata.get("media_type", "unknown")
-                    })
-        with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable_history, f, ensure_ascii=False, indent=2)
-        logger.info(f"💾 Historial guardado: {len(serializable_history)} mensajes (con URLs de ComfyUI)")
-    except Exception as e:
-        logger.error(f"❌ Error guardando historial: {e}")
-
-def load_chat_history():
-    """Carga el historial del chat desde el archivo JSON, descargando archivos de ComfyUI"""
-    try:
-        if os.path.exists(CHAT_HISTORY_FILE):
-            with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                saved_history = json.load(f)
-            # Reconstruir el historial descargando archivos a temporal
-            history = []
-            for msg in saved_history:
-                if isinstance(msg, dict) and "role" in msg:
-                    comfy_url = msg.get("comfy_url")
-                    media_type = msg.get("media_type")
-                    # Si tiene comfy_url, descargar a archivo temporal
-                    if comfy_url:
-                        try:
-                            response = requests.get(comfy_url, timeout=30)
-                            if response.status_code == 200:
-                                ext = ".mp4" if media_type == "video" else ".png"
-                                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                                temp_file.write(response.content)
-                                temp_file.close()
-                                temp_path = temp_file.name
-                                history.append({
-                                    "role": msg["role"],
-                                    "content": {"path": temp_path},
-                                    "metadata": {"comfy_url": comfy_url, "media_type": media_type}
-                                })
-                                logger.info(f"📥 Descargado: {comfy_url}")
-                            else:
-                                logger.warning(f"⚠️ HTTP {response.status_code}: {comfy_url}")
-                                history.append({
-                                    "role": msg["role"],
-                                    "content": f"[Media no disponible]"
-                                })
-                        except Exception as e:
-                            logger.error(f"❌ Error descargando: {e}")
-                            history.append({
-                                "role": msg["role"],
-                                "content": f"[Media no disponible]"
-                            })
-                    elif msg.get("content"):  # Mensaje de texto
-                        history.append({
-                            "role": msg["role"],
-                            "content": msg["content"]
-                        })
-            logger.info(f"📂 Historial cargado: {len(history)} mensajes")
-            return history
-    except Exception as e:
-        logger.error(f"❌ Error cargando historial: {e}")
-    return []
-
-def clear_chat_history():
-    """Limpia el archivo de historial del chat"""
-    try:
-        if os.path.exists(CHAT_HISTORY_FILE):
-            os.remove(CHAT_HISTORY_FILE)
-            logger.info("🗑️ Historial eliminado")
-        # También limpiar archivos temporales de media
-        import shutil
-        if os.path.exists(MEDIA_DIR):
-            shutil.rmtree(MEDIA_DIR)
-            os.makedirs(MEDIA_DIR, exist_ok=True)
-            logger.info("🗑️ Directorio de media limpiado")
-    except Exception as e:
-        logger.error(f"❌ Error eliminando historial: {e}")
 
 # ----------------------------------------------------
 # 0️⃣ Global state – keeps the **current base image name** that will be
@@ -400,15 +299,26 @@ async def process_image(prompt_text, source_path=None):
     # ---- 5️⃣ Retrieve result --------------------------------------------
     history_res = requests.get(f"{COMFY_URL}/history/{prompt_id}").json()
     prompt_data = history_res.get(prompt_id, {})
-    if "outputs" not in prompt_data or "6" not in prompt_data["outputs"]:
-        raise Exception(f"Image generation completed but no output found in node 6. Available outputs: {list(prompt_data.get('outputs', {}).keys())}")
-    output_info = prompt_data["outputs"]["6"]["images"][0]
 
-    # ---- 6️⃣ Construir URL de ComfyUI (el archivo ya está guardado ahí) ----
-    comfy_url = f"{COMFY_URL}/view?filename={output_info['filename']}&type={output_info['type']}"
+    # Be tolerant to workflow changes: some workflows use node '6', others use '16'.
+    outputs = prompt_data.get("outputs", {})
 
-    # ---- 7️⃣ Descargar temporalmente para re-upload y llama.cpp ---------
-    img_response = requests.get(comfy_url)
+    # Directly use node 16 for output
+    output_node_key = "16"
+    if output_node_key not in outputs:
+        raise Exception(f"Image generation completed but no image output found in node {output_node_key}. Available outputs: {list(outputs.keys())}")
+
+    node_outputs = outputs[output_node_key]
+    if "images" in node_outputs and len(node_outputs["images"]) > 0:
+        output_info = node_outputs["images"][0]
+    elif "gifs" in node_outputs and len(node_outputs["gifs"]) > 0:
+        output_info = node_outputs["gifs"][0]
+    else:
+        raise Exception(f"No usable image/gif found in node {output_node_key}. Keys: {list(node_outputs.keys())}")
+
+    # ---- 6️⃣ Download generated image ------------------------------------
+    view_url = f"{COMFY_URL}/view?filename={output_info['filename']}&type={output_info['type']}"
+    img_response = requests.get(view_url)
     if img_response.status_code != 200:
         raise Exception(f"Failed to download image: HTTP {img_response.status_code}")
     img_data = img_response.content
@@ -417,14 +327,15 @@ async def process_image(prompt_text, source_path=None):
     temp_file.write(img_data)
     temp_file.close()
 
-    # Re-upload the generated image to make it the new base
+    # ---- 7️⃣ Re-upload the generated image to make it the new base ------
+    # This ensures base_image_name always points to a file ComfyUI can access
     base_image_name = upload_to_comfy(temp_file.name)
 
-    # Update base_image_path for llama.cpp enhancement
+    # Also update base_image_path to the local temp file for llama.cpp enhancement
     global base_image_path
     base_image_path = temp_file.name
 
-    return temp_file.name, "image", comfy_url
+    return temp_file.name, "image"
 
 # ----------------------------------------------------
 # 2️⃣ Process VIDEO workflow (LTXV-DoAlmostEverything-v3.json) - FIXED
@@ -513,12 +424,11 @@ async def process_video(prompt_text, source_path=None):
 
     logger.info(f"Video from ComfyUI: filename={filename}, subfolder={subfolder}, type={file_type}")
 
-    # Construir URL de ComfyUI (el video ya está guardado ahí)
-    comfy_url = f"{COMFY_URL}/view?filename={filename}&type={file_type}&subfolder={subfolder}"
-    logger.debug(f"Video URL: {comfy_url}")
+    # Construir URL de descarga CON subfolder
+    view_url = f"{COMFY_URL}/view?filename={filename}&type={file_type}&subfolder={subfolder}"
+    logger.debug(f"Downloading video from: {view_url}")
 
-    # Descargar temporalmente para reproducción local
-    video_response = requests.get(comfy_url)
+    video_response = requests.get(view_url)
     if video_response.status_code != 200:
         raise Exception(f"Failed to download video: HTTP {video_response.status_code}")
     video_data = video_response.content
@@ -526,7 +436,7 @@ async def process_video(prompt_text, source_path=None):
     if len(video_data) == 0:
         raise Exception("Downloaded video is empty (0 bytes)")
 
-    # Guardar en ubicación temporal para reproducción
+    # Guardar en ubicación persistente
     timestamp = int(time.time())
     safe_filename = filename.replace("/", "_").replace("\\", "_")
     video_path = os.path.join(OUTPUT_DIR, f"video_{prompt_id[:8]}_{timestamp}_{safe_filename}")
@@ -535,12 +445,12 @@ async def process_video(prompt_text, source_path=None):
         f.write(video_data)
 
     file_size = os.path.getsize(video_path)
-    logger.info(f"Video cached to {video_path}, size: {file_size} bytes")
+    logger.info(f"Video saved to {video_path}, size: {file_size} bytes")
 
     if file_size == 0:
         raise Exception("Saved video file is empty")
 
-    return video_path, "video", comfy_url
+    return video_path, "video"
 
 # ----------------------------------------------------
 # 4️⃣ Updated chat_fn – handles both image and video modes
@@ -584,10 +494,9 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
         history.append({"role": "user", "content": display_text if display_text else "🖼️ Generar imagen"})
 
     try:
-        comfy_url = None
         if mode == "video":
-            result_path, result_type, comfy_url = await process_video(text, src_path)
-            logger.info(f"Returning video path: {result_path}, ComfyURL: {comfy_url}")
+            result_path, result_type = await process_video(text, src_path)
+            logger.info(f"Returning video path: {result_path}")
 
             # If enhanced, show it as assistant message before the result
             if enhanced_text and enhanced_text != original_text:
@@ -596,15 +505,14 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
                     "content": f"✨ *Prompt mejorado:* {enhanced_text}"
                 })
 
-            # Guardar la URL de ComfyUI en metadata del mensaje
             history.append({
                 "role": "assistant",
-                "content": gr.Video(value=result_path),
-                "metadata": {"comfy_url": comfy_url, "media_type": "video"}
+                "content": gr.Video(
+                    value=result_path
+                )
             })
         else:  # mode == "image"
-            result_path, result_type, comfy_url = await process_image(text, src_path)
-            logger.info(f"Returning image path: {result_path}, ComfyURL: {comfy_url}")
+            result_path, result_type = await process_image(text, src_path)
 
             # If enhanced, show it as assistant message before the result
             if enhanced_text and enhanced_text != original_text:
@@ -613,15 +521,13 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
                     "content": f"✨ *Prompt mejorado:* {enhanced_text}"
                 })
 
-            # Guardar la URL de ComfyUI en metadata del mensaje
             history.append({
                 "role": "assistant",
-                "content": gr.Image(value=result_path),
-                "metadata": {"comfy_url": comfy_url, "media_type": "image"}
+                "content": gr.Image(
+                    result_path
+                )
             })
 
-        # Guardar historial después de cada interacción exitosa
-        save_chat_history(history)
         return history
 
     except Exception as e:
@@ -629,8 +535,6 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
         history.append(
             {"role": "assistant", "content": f"Error procesando {mode}: {str(e)}"}
         )
-        # Guardar historial incluso si hay error
-        save_chat_history(history)
         return history
 
 # ----------------------------------------------------
@@ -643,7 +547,6 @@ with gr.Blocks(fill_width=True, fill_height=True) as demo:
         height="75vh",
         elem_id="chatbot",
         autoscroll=True,
-        value=load_chat_history(),  # Cargar historial al iniciar
     )
 
     chat_input = gr.MultimodalTextbox(
@@ -654,9 +557,8 @@ with gr.Blocks(fill_width=True, fill_height=True) as demo:
 
     with gr.Row():
         auto_enhance = gr.Checkbox(label="🤖 Mejorar con IA", value=False, scale=1)
-        btn_send = gr.Button("Generar Imagen 🖼️ (default)", variant="primary", scale=3)
-        btn_video = gr.Button("Generar Video 🎬", variant="primary", scale=3)
-        btn_clear = gr.Button("🗑️ Limpiar Chat", variant="secondary", scale=2)
+        btn_send = gr.Button("Generar Imagen 🖼️ (default)", variant="primary", scale=4)
+        btn_video = gr.Button("Generar Video 🎬", variant="primary", scale=4)
 
     # Image processing with optional auto-enhance
     async def process_image_with_enhance(message, history, auto_enhance_checked):
@@ -736,16 +638,6 @@ with gr.Blocks(fill_width=True, fill_height=True) as demo:
     ).then(
         fn=lambda: gr.update(value=None),
         outputs=[chat_input],
-    )
-
-    # Clear chat button
-    def clear_chat():
-        clear_chat_history()
-        return []  # Retorna historial vacío
-
-    btn_clear.click(
-        fn=clear_chat,
-        outputs=[chatbot],
     )
 
 # ----------------------------------------------------

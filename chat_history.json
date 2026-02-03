@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "conviertela en arquera realista sin cambiar demaciado su rostro"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "comfy_url": "http://127.0.0.1:8188/view?filename=ComfyUI_temp_cqsmd_00003_.png&type=temp",
+    "media_type": "image"
+  }
+]

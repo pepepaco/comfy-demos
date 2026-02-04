@@ -9,6 +9,7 @@ import tempfile
 import logging
 import time
 import base64
+from pathlib import Path
 
 # ----------------------------------------------------
 # Configuración
@@ -18,6 +19,11 @@ COMFY_URL = f"http://{SERVER_ADDR}"
 WS_URL = f"ws://{SERVER_ADDR}/ws"
 CLIENT_ID = str(uuid.uuid4())
 LLAMA_CPP_URL = "http://127.0.0.1:8080"
+
+# Directorio para historial (solo JSON, archivos están en ComfyUI)
+PERSISTENT_DIR = Path(__file__).parent / "gradio_cache"
+PERSISTENT_DIR.mkdir(exist_ok=True)
+CHAT_HISTORY_FILE = PERSISTENT_DIR / "chat_history.json"
 
 OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "comfychat_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -92,6 +98,109 @@ MODE_CONFIG = {
         "default_label": "🎬 Generate video",
     },
 }
+
+# ----------------------------------------------------
+# Persistencia del historial (solo URLs de ComfyUI)
+# ----------------------------------------------------
+def save_chat_history(history):
+    """Guarda historial con URLs de ComfyUI (sin descargar archivos)."""
+    serializable = []
+    for msg in history:
+        if not isinstance(msg, dict) or "role" not in msg:
+            continue
+
+        meta = msg.get("metadata", {})
+        content = msg.get("content")
+
+        # Si tiene metadata con comfy_url, guardar la URL
+        if meta and meta.get("comfy_url"):
+            serializable.append({
+                "role": msg["role"],
+                "comfy_url": meta["comfy_url"],
+                "media_type": meta.get("media_type", "image")
+            })
+        # Si es texto, guardarlo
+        elif isinstance(content, str):
+            serializable.append({
+                "role": msg["role"],
+                "content": content
+            })
+
+    try:
+        with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        logger.info(f"💾 Historial guardado: {len(serializable)} mensajes (solo URLs)")
+    except Exception as e:
+        logger.error(f"❌ Error guardando historial: {e}")
+
+
+def load_chat_history():
+    """Carga historial apuntando directamente a URLs de ComfyUI."""
+    if not CHAT_HISTORY_FILE.exists():
+        return []
+
+    try:
+        with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+
+        history = []
+        last_image_url = None
+
+        for msg in saved:
+            if not isinstance(msg, dict) or "role" not in msg:
+                continue
+
+            comfy_url = msg.get("comfy_url")
+            media_type = msg.get("media_type")
+
+            # Si tiene URL de ComfyUI, usar dict con path (Gradio puede cargar URLs)
+            if comfy_url:
+                history.append({
+                    "role": msg["role"],
+                    "content": {"path": comfy_url},
+                    "metadata": {
+                        "comfy_url": comfy_url,
+                        "media_type": media_type
+                    }
+                })
+                # Rastrear última imagen (no video) para restaurar como base
+                if media_type == "image":
+                    last_image_url = comfy_url
+            # Si es texto
+            elif msg.get("content"):
+                history.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+        # Restaurar última imagen como base (necesitamos descargarla solo para re-upload)
+        if last_image_url:
+            try:
+                resp = requests.get(last_image_url, timeout=10)
+                if resp.status_code == 200:
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                    temp_file.write(resp.content)
+                    temp_file.close()
+                    upload_to_comfy(temp_file.name)
+                    logger.info(f"🔄 Base restaurada: {base_image_name}")
+                else:
+                    logger.warning(f"⚠️ No se pudo descargar imagen base: HTTP {resp.status_code}")
+            except Exception as e:
+                logger.error(f"❌ Error restaurando base: {e}")
+
+        logger.info(f"📂 Historial cargado: {len(history)} mensajes")
+        return history
+    except Exception as e:
+        logger.error(f"❌ Error cargando historial: {e}")
+        return []
+
+
+def clear_chat_history():
+    """Elimina solo el archivo de historial (no borra archivos de ComfyUI)."""
+    if CHAT_HISTORY_FILE.exists():
+        os.remove(CHAT_HISTORY_FILE)
+    logger.info("🗑️ Historial eliminado (archivos en ComfyUI permanecen)")
+
 
 # ----------------------------------------------------
 # Utilidades
@@ -224,41 +333,10 @@ async def poll_until_output(prompt_id, output_node, timeout_secs=600):
 
 
 # ----------------------------------------------------
-# Serialización para localStorage
-# ----------------------------------------------------
-def serialize_history_for_storage(history):
-    """Serializa solo URLs de ComfyUI y texto."""
-    serializable = []
-    for msg in history:
-        if not isinstance(msg, dict) or "role" not in msg:
-            continue
-
-        meta = msg.get("metadata", {})
-        content = msg.get("content")
-
-        # Si tiene metadata con comfy_url, guardar eso
-        if meta and meta.get("comfy_url"):
-            serializable.append({
-                "role": msg["role"],
-                "comfy_url": meta["comfy_url"],
-                "media_type": meta.get("media_type", "unknown"),
-            })
-        # Si es texto plano, guardarlo
-        elif isinstance(content, str):
-            serializable.append({
-                "role": msg["role"],
-                "content": content
-            })
-
-    logger.info(f"📝 Serializado: {len(serializable)} mensajes")
-    return serializable
-
-
-# ----------------------------------------------------
 # Generadores
 # ----------------------------------------------------
 async def process_image(prompt_text):
-    """Generate image with Qwen."""
+    """Generate image with Qwen. Returns local path and ComfyUI URL."""
     global base_image_name, base_image_path
 
     if not base_image_name:
@@ -286,7 +364,7 @@ async def process_image(prompt_text):
 
     logger.info(f"🖼️ Image URL: {comfy_url}")
 
-    # Descargar temporalmente
+    # Descargar temporalmente para mostrar Y para re-upload
     resp = requests.get(comfy_url)
     if resp.status_code != 200:
         raise Exception(f"Download failed: HTTP {resp.status_code}")
@@ -302,7 +380,7 @@ async def process_image(prompt_text):
 
 
 async def process_video(prompt_text):
-    """Generate video with LTXV."""
+    """Generate video with LTXV. Returns local path and ComfyUI URL."""
     if not base_image_name:
         raise Exception("Se requiere imagen base")
 
@@ -339,7 +417,7 @@ async def process_video(prompt_text):
 
     logger.info(f"🎬 Video URL: {comfy_url}")
 
-    # Descargar
+    # Descargar a temporal para reproducción
     resp = requests.get(comfy_url)
     if resp.status_code != 200:
         raise Exception(f"Download failed: HTTP {resp.status_code}")
@@ -389,7 +467,7 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
         upload_to_comfy(src_path)
         history.append({
             "role": "user",
-            "content": {"path": src_path}  # Usar dict para Gradio 4/5
+            "content": {"path": src_path}
         })
 
     # Validate base image exists
@@ -398,7 +476,8 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
             "role": "assistant",
             "content": "⚠️ Se requiere una imagen. Sube una primero."
         })
-        return history, serialize_history_for_storage(history)
+        save_chat_history(history)
+        return history
 
     # Add user text
     display_text = original_text if original_text is not None else text
@@ -409,7 +488,7 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
         })
 
     try:
-        # Generate
+        # Generate (retorna path local + URL de ComfyUI)
         result_path, comfy_url = await GENERATORS[mode](text)
         logger.info("%s OK: %s | URL: %s", mode.upper(), result_path, comfy_url)
 
@@ -420,10 +499,10 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
                 "content": f"✨ *Prompt mejorado:* {enhanced_text}"
             })
 
-        # Add result
+        # Add result con path local (para mostrar) y metadata con URL (para persistencia)
         history.append({
             "role": "assistant",
-            "content": {"path": result_path},  # Usar dict para Gradio 4/5
+            "content": {"path": result_path},
             "metadata": {
                 "comfy_url": comfy_url,
                 "media_type": mode
@@ -437,7 +516,8 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
             "content": f"Error procesando {mode}: {e}"
         })
 
-    return history, serialize_history_for_storage(history)
+    save_chat_history(history)
+    return history
 
 
 # ----------------------------------------------------
@@ -473,66 +553,21 @@ async def handle_generation(message, history, auto_enhance_checked, mode):
             logger.error("❌ Enhance failed: %s", e)
 
     gen_message = {"text": prompt_to_use, "files": files}
-    updated_history, serialized = await chat_fn(gen_message, history, mode, user_text, enhanced_prompt)
-
-    return updated_history, serialized, base_image_name
+    return await chat_fn(gen_message, history, mode, user_text, enhanced_prompt)
 
 
 # ----------------------------------------------------
 # UI
 # ----------------------------------------------------
-with gr.Blocks(fill_width=True, fill_height=True, head="""
-<script>
-window.addEventListener('load', function() {
-    const stored = localStorage.getItem('comfy_chat_history');
-    if (stored) {
-        try {
-            const history = JSON.parse(stored);
-            console.log('📂 Encontrado en localStorage:', history.length, 'mensajes');
-            setTimeout(() => {
-                const trigger = document.querySelector('#restore_trigger textarea');
-                if (trigger) {
-                    trigger.value = stored;
-                    trigger.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }, 1500);
-        } catch(e) {
-            console.error('Error:', e);
-        }
-    }
-});
-
-window.saveToStorage = (history, baseImage) => {
-    try {
-        localStorage.setItem('comfy_chat_history', JSON.stringify(history));
-        if (baseImage) {
-            localStorage.setItem('comfy_base_image', baseImage);
-        }
-        console.log('💾 Guardado:', history.length, 'mensajes');
-    } catch(e) {
-        console.error('Error guardando:', e);
-    }
-};
-
-window.clearStorage = () => {
-    localStorage.removeItem('comfy_chat_history');
-    localStorage.removeItem('comfy_base_image');
-    console.log('🗑️ localStorage limpiado');
-};
-</script>
-""") as demo:
+with gr.Blocks(fill_width=True, fill_height=True) as demo:
     gr.Markdown("## 💬 ComfyUI Multi-Modal Chat (Image + Video)")
-
-    storage_state = gr.State(value=[])
-    base_image_state = gr.State(value=None)
-    restore_trigger = gr.Textbox(visible=False, elem_id="restore_trigger")
 
     chatbot = gr.Chatbot(
         label="QwenAI",
         height="75vh",
         elem_id="chatbot",
         autoscroll=True,
-        value=[],
+        value=[],  # load_chat_history() desactivado temporalmente
     )
 
     chat_input = gr.MultimodalTextbox(
@@ -547,88 +582,15 @@ window.clearStorage = () => {
         btn_video = gr.Button("Generar Video 🎬", variant="primary", scale=3)
         btn_clear = gr.Button("🗑️ Limpiar", variant="secondary", scale=2)
 
-    # Restore function
-    def restore_from_storage(stored_json):
-        """Reconstruye historial desde localStorage."""
-        if not stored_json:
-            return []
-
-        try:
-            stored = json.loads(stored_json)
-            history = []
-            last_image_url = None
-
-            for msg in stored:
-                if not isinstance(msg, dict) or "role" not in msg:
-                    continue
-
-                comfy_url = msg.get("comfy_url")
-                media_type = msg.get("media_type")
-
-                if comfy_url:
-                    # Usar dict con URL de ComfyUI para que Gradio la cargue directamente
-                    history.append({
-                        "role": msg["role"],
-                        "content": {"path": comfy_url},  # Gradio Chatbot acepta URLs en dicts
-                        "metadata": {
-                            "comfy_url": comfy_url,
-                            "media_type": media_type
-                        }
-                    })
-                    if media_type == "image":
-                        last_image_url = comfy_url
-                elif msg.get("content"):
-                    history.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-
-            logger.info(f"📂 Restaurado: {len(history)} mensajes")
-
-            # Restaurar última imagen como base
-            if last_image_url:
-                try:
-                    resp = requests.get(last_image_url)
-                    if resp.status_code == 200:
-                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                        temp_file.write(resp.content)
-                        temp_file.close()
-                        upload_to_comfy(temp_file.name)
-                        logger.info(f"🔄 Base restaurada: {base_image_name}")
-                except Exception as e:
-                    logger.error(f"❌ Error restaurando base: {e}")
-
-            return history
-        except Exception as e:
-            logger.error(f"❌ Error: {e}")
-            return []
-
-    restore_trigger.change(
-        fn=restore_from_storage,
-        inputs=[restore_trigger],
-        outputs=[chatbot]
-    )
-
-    # Wire buttons
+    # Wire buttons (sin localStorage, solo guardado automático)
     def wire(trigger, mode):
         def sync_handler(msg, hist, enhance):
             return asyncio.run(handle_generation(msg, hist, enhance, mode))
 
-        outputs_tuple = trigger.click(
+        trigger.click(
             fn=sync_handler,
             inputs=[chat_input, chatbot, auto_enhance],
-            outputs=[chatbot, storage_state, base_image_state],
-        )
-
-        outputs_tuple.then(
-            fn=None,
-            inputs=[storage_state, base_image_state],
-            outputs=[],
-            js="""(history, baseImage) => {
-                if (window.saveToStorage) {
-                    window.saveToStorage(history, baseImage);
-                }
-            }"""
+            outputs=[chatbot],
         ).then(
             fn=lambda: gr.update(value=None),
             outputs=[chat_input]
@@ -637,24 +599,14 @@ window.clearStorage = () => {
     wire(btn_image, "image")
     wire(btn_video, "video")
 
-    # Enter key
+    # Enter key → imagen
     def sync_image_handler(msg, hist, enhance):
         return asyncio.run(handle_generation(msg, hist, enhance, "image"))
 
-    submit_event = chat_input.submit(
+    chat_input.submit(
         fn=sync_image_handler,
         inputs=[chat_input, chatbot, auto_enhance],
-        outputs=[chatbot, storage_state, base_image_state],
-    )
-    submit_event.then(
-        fn=None,
-        inputs=[storage_state, base_image_state],
-        outputs=[],
-        js="""(history, baseImage) => {
-            if (window.saveToStorage) {
-                window.saveToStorage(history, baseImage);
-            }
-        }"""
+        outputs=[chatbot],
     ).then(
         fn=lambda: gr.update(value=None),
         outputs=[chat_input]
@@ -665,15 +617,12 @@ window.clearStorage = () => {
         global base_image_name, base_image_path
         base_image_name = None
         base_image_path = None
-        return [], [], None
+        clear_chat_history()
+        return []
 
-    clear_event = btn_clear.click(
+    btn_clear.click(
         fn=clear_all,
-        outputs=[chatbot, storage_state, base_image_state],
-    )
-    clear_event.then(
-        fn=None,
-        js="() => { if (window.clearStorage) window.clearStorage(); }"
+        outputs=[chatbot],
     )
 
 if __name__ == "__main__":

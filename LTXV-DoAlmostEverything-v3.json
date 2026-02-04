@@ -77,11 +77,11 @@
       ],
       "format": "video/nvenc_h264-mp4",
       "pix_fmt": "yuv420p",
-      "bitrate": 5,
+      "bitrate": 20,
       "megabit": true,
       "save_metadata": true,
       "pingpong": false,
-      "save_output": true,
+      "save_output": false,
       "images": [
         "138",
         0
@@ -365,10 +365,10 @@
   },
   "88": {
     "inputs": {
-      "clip_name1": "gemma_3_12B_it_fp4_mixed.safetensors",
+      "clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors",
       "clip_name2": "ltx-2-19b-embeddings_connector_distill_bf16.safetensors",
       "type": "ltxv",
-      "device": "cpu"
+      "device": "default"
     },
     "class_type": "DualCLIPLoader",
     "_meta": {
@@ -430,7 +430,7 @@
   },
   "106": {
     "inputs": {
-      "image": "tmpx6ex198_.png"
+      "image": "tmpvymjmqcp.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -613,7 +613,7 @@
         "139",
         0
       ],
-      "ensemble": false,
+      "ensemble": true,
       "images": [
         "133",
         0

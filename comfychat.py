@@ -8,11 +8,6 @@ import os
 import tempfile
 import logging
 import time
-import base64
-from pathlib import Path
-from PIL import Image
-from io import BytesIO
-import io
 
 # ----------------------------------------------------
 # Configuración
@@ -21,71 +16,12 @@ SERVER_ADDR = "127.0.0.1:8188"
 COMFY_URL = f"http://{SERVER_ADDR}"
 WS_URL = f"ws://{SERVER_ADDR}/ws"
 CLIENT_ID = str(uuid.uuid4())
-LLAMA_CPP_URL = "http://127.0.0.1:8080"
-
-# Directorio para historial (solo JSON, archivos están en ComfyUI)
-PERSISTENT_DIR = Path(__file__).parent / "gradio_cache"
-PERSISTENT_DIR.mkdir(exist_ok=True)
-CHAT_HISTORY_FILE = PERSISTENT_DIR / "chat_history.json"
 
 OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "comfychat_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-# ----------------------------------------------------
-# System Prompts
-# ----------------------------------------------------
-IMAGE_SYSTEM_PROMPT = """# ROLE
-You are a Senior Prompt Engineer specialized in Image Editing for models like Qwen Image Edit and Flux Kontext. Your goal is to transform a user's edit request and an input image into a precise, high-fidelity technical prompt that ensures seamless integration.
-
-# CORE OPERATIONAL RULES
-1. **ANALYZE FIRST**: Identify the subject's identity, lighting direction, material textures, and the overall artistic style (e.g., cinematic, 3D render, oil painting).
-2. **ANCHORING**: Explicitly name the elements that MUST remain identical (e.g., "keeping the background, pose, and facial features unchanged").
-3. **PHYSICAL INTEGRATION**: When adding or changing objects, describe how they interact with the environment. Mention shadows, reflections, and how the new element sits or rests within the space.
-4. **MATERIAL CONSISTENCY**: Match the texture of the new element to the existing scene (e.g., if the scene is grainy film, the edit must have film grain).
-5. **SPATIAL LOGIC**: Use precise positioning (e.g., "placed directly behind," "resting on the left edge of") to avoid floating or misaligned objects.
-
-# PROMPT GUIDELINES
-- **Style Continuity**: Always reaffirm the original medium/style at the end of the prompt to prevent "style drift."
-- **Natural Narrative**: Write in fluid, descriptive English sentences. Avoid keyword stuffing or comma-separated lists.
-- **Negative Avoidance**: Describe what the new state looks like rather than telling the model what to "remove."
-- **No Fluff**: Do not use "masterpiece," "8k," or "ultra-detailed" unless the user specifically asks for a quality boost.
-
-# OUTPUT STRUCTURE
-Generate a single paragraph (50-120 words) following this flow:
-[Subject/Context Preservation] + [Specific Modification with Physical & Lighting Details] + [Spatial Placement] + [Style/Camera Anchor].
-
-# EXAMPLE
-User Request: "Add a black leather jacket to the man"
-Improved Output: "The man from the original image maintains his exact pose and facial expression, but is now wearing a premium black leather jacket with a subtle matte finish. The jacket features realistic creases and highlights that match the existing side-lighting of the scene. The original urban alleyway background and the cinematic 35mm film photography style remain untouched, ensuring the jacket looks perfectly integrated into the environment."
-
-# FINAL INSTRUCTION
-Output ONLY the final prompt text. No explanations, no greetings, no markdown blocks."""
-
-VIDEO_SYSTEM_PROMPT = """
-"## Role: LTX-2 Motion Engineer
-You transform an image and a user request into a high-motion video prompt.
-
-## Rules for LTX-2 Success:
-1. NO REDUNDANCY: Do not describe colors or clothes already visible in the image.
-2. IMMEDIATE ACTION: Start with the action. Use "is currently [action]" or "[Subject] [verb]s". Never use "starts to" or "begins".
-3. MOTION PHYSICS: Describe weight and inertia. Use phrases like "weight shifts," "fabric ripples," or "momentum carries" to give life to the motion.
-4. STABLE CAMERA (Default): Unless the user specifies a movement, the camera must remain at a safe, consistent distance, keeping the main subject perfectly centered. Use "Steady tracking shot" or "Fixed medium shot" to maintain focus on the subject's movement without distorting the background.
-5. FLOW: One fluid paragraph (max 90 words). Output ONLY the final prompt in English.
-
-## Output Template:
-[Immediate Action + Physics] + [Atmospheric/Environmental interaction] + [Steady centered camera shot].
-
-## Examples:
-User: "She is dancing"
-Target: "The character performs a fluid dance, her body rotating with natural momentum while her hair and clothes react to the centrifugal force. A steady tracking shot keeps her perfectly centered at a medium distance, capturing her full range of motion without any abrupt camera shifts. The lighting remains consistent as she moves."
-
-User: "He is running"
-Target: "The man runs forward with powerful strides, his feet pressing into the ground and his arms pumping rhythmically. A stable tracking shot follows him at a constant distance, keeping him locked in the center of the frame. The background blurs slightly to emphasize his speed while maintaining temporal coherence.
-
-"""
 
 # ----------------------------------------------------
 # Estado global
@@ -95,117 +31,12 @@ base_image_path = None
 
 MODE_CONFIG = {
     "image": {
-        "system_prompt": IMAGE_SYSTEM_PROMPT,
         "default_label": "🖼️ Generar imagen",
     },
     "video": {
-        "system_prompt": VIDEO_SYSTEM_PROMPT,
         "default_label": "🎬 Generate video",
     },
 }
-
-# ----------------------------------------------------
-# Persistencia del historial (solo URLs de ComfyUI)
-# ----------------------------------------------------
-def save_chat_history(history):
-    """Guarda historial con URLs de ComfyUI (sin descargar archivos)."""
-    serializable = []
-    for msg in history:
-        if not isinstance(msg, dict) or "role" not in msg:
-            continue
-
-        meta = msg.get("metadata", {})
-        content = msg.get("content")
-
-        # Si tiene metadata con comfy_url, guardar la URL
-        if meta and meta.get("comfy_url"):
-            serializable.append({
-                "role": msg["role"],
-                "comfy_url": meta["comfy_url"],
-                "media_type": meta.get("media_type", "image")
-            })
-        # Si es texto, guardarlo
-        elif isinstance(content, str):
-            serializable.append({
-                "role": msg["role"],
-                "content": content
-            })
-
-    try:
-        with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-        logger.info(f"💾 Historial guardado: {len(serializable)} mensajes (solo URLs)")
-    except Exception as e:
-        logger.error(f"❌ Error guardando historial: {e}")
-
-
-def load_chat_history():
-    """Carga historial apuntando directamente a URLs de ComfyUI."""
-    if not CHAT_HISTORY_FILE.exists():
-        return []
-
-    try:
-        with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-
-        history = []
-        last_image_url = None
-
-        for msg in saved:
-            if not isinstance(msg, dict) or "role" not in msg:
-                continue
-
-            comfy_url = msg.get("comfy_url")
-            media_type = msg.get("media_type")
-
-            # Si tiene URL de ComfyUI, usar dict con path (Gradio puede cargar URLs)
-            if comfy_url:
-                history.append({
-                    "role": msg["role"],
-                    "content": {"path": comfy_url},
-                    "metadata": {
-                        "comfy_url": comfy_url,
-                        "media_type": media_type
-                    }
-                })
-                # Rastrear última imagen (no video) para restaurar como base
-                if media_type == "image":
-                    last_image_url = comfy_url
-            # Si es texto
-            elif msg.get("content"):
-                history.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-
-        # Restaurar última imagen como base (necesitamos descargarla solo para re-upload)
-        if last_image_url:
-            try:
-                resp = requests.get(last_image_url, timeout=10)
-                if resp.status_code == 200:
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                    temp_file.write(resp.content)
-                    temp_file.close()
-                    asyncio.run(upload_to_comfy(temp_file.name))  # ✅ Await async call in sync context
-                    logger.info(f"🔄 Base restaurada: {base_image_name}")
-                else:
-                    logger.warning(f"⚠️ No se pudo descargar imagen base: HTTP {resp.status_code}")
-            except Exception as e:
-                logger.error(f"❌ Error restaurando base: {e}")
-
-        logger.info(f"📂 Historial cargado: {len(history)} mensajes")
-        return history
-    except Exception as e:
-        logger.error(f"❌ Error cargando historial: {e}")
-        return []
-
-
-def clear_chat_history():
-    """Elimina solo el archivo de historial (no borra archivos de ComfyUI)."""
-    if CHAT_HISTORY_FILE.exists():
-        os.remove(CHAT_HISTORY_FILE)
-    logger.info("🗑️ Historial eliminado (archivos en ComfyUI permanecen)")
-
 
 # ------------------------------------
 # Utilidades
@@ -224,89 +55,6 @@ async def upload_to_comfy(file_path):
     base_image_path = file_path
     logger.info(f"📤 Uploaded to ComfyUI: {base_image_name}")
     return base_image_name
-
-
-def encode_image_to_base64(file_path, max_size_mb=1.0):
-    """Encodes image to Base64, specifically for Llama.cpp:
-    - Resizes to max 1024px on the longest side.
-    - Compresses to 50% JPEG quality.
-    """
-    # `from PIL import Image` and `import io` are expected to be at the top of the file.
-    import io # Ensure io is imported locally if not globally
-
-    # Open image
-    img = Image.open(file_path)
-
-    # Calculate new dimensions: max 1024px on longest side, maintain aspect ratio
-    original_width, original_height = img.size
-    if max(original_width, original_height) > 1024:
-        if original_width > original_height:
-            new_width = 1024
-            new_height = int(original_height * (new_width / original_width))
-        else:
-            new_height = 1024
-            new_width = int(original_width * (new_height / original_height))
-        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        logger.info(f"🖼️ Resized for Llama.cpp: {original_width}x{original_height} -> {new_width}x{new_height}")
-
-    # Convert to RGB if not already (JPEG doesn't support RGBA)
-    if img.mode == 'RGBA':
-        img = img.convert('RGB')
-
-    # Save to BytesIO with 50% JPEG quality
-    output_buffer = io.BytesIO()
-    img.save(output_buffer, format="JPEG", quality=50) # Fixed quality to 50%
-    img_bytes = output_buffer.getvalue()
-
-    logger.info(f"✅ Image prepared for Llama.cpp (size: {len(img_bytes) / 1024 / 1024:.2f}MB, quality: 50%)")
-
-    return base64.b64encode(img_bytes).decode("utf-8")
-
-
-async def enhance_prompt_with_llama(user_text, image_path=None, system_prompt=None, mode="image"):
-    """Call llama.cpp to enhance prompt (Async)."""
-    logger.debug("Inside enhance_prompt_with_llama for mode: %s, image_path: %s", mode, image_path)
-    system_prompt = system_prompt or IMAGE_SYSTEM_PROMPT
-    default_text = f"Improve this prompt for AI {mode} generation"
-    final_text = user_text or default_text
-
-    user_content = [{"type": "text", "text": final_text}]
-    has_image = image_path and os.path.exists(image_path)
-    if has_image:
-        user_content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{encode_image_to_base64(image_path)}"},
-        })
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-
-    logger.info("🪄 LLAMA.CPP REQUEST | has_image=%s | text='%s'", has_image, final_text[:80])
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{LLAMA_CPP_URL}/v1/chat/completions",
-                json={"messages": messages, "temperature": 0.7, "max_tokens": 512, "stream": False, "reset": True},
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                enhanced = data["choices"][0]["message"]["content"].strip().replace("```", "")
-                logger.info("✨ Enhanced: %s", enhanced[:100])
-                return enhanced
-    except aiohttp.ClientResponseError as e:
-        logger.error(f"❌ Llama.cpp HTTP Error: {e.status} - {e.message}")
-        raise Exception(f"Llama.cpp regresó error {e.status}: {e.message}")
-    except aiohttp.ClientConnectorError as e:
-        logger.error(f"❌ Llama.cpp conexión rechazada o no disponible en {LLAMA_CPP_URL}: {e}")
-        raise Exception(f"llama.cpp no disponible en {LLAMA_CPP_URL}: {e}")
-    except Exception as e:
-        logger.error(f"Error inesperado en llama.cpp: {type(e).__name__} - {e}")
-        raise Exception(f"Error en llama.cpp: {type(e).__name__} - {e}")
-
 
 async def submit_and_wait(workflow):
     """Submit workflow and wait via WebSocket."""
@@ -350,7 +98,7 @@ async def poll_until_output(prompt_id, output_node, timeout_secs=600):
 # ----------------------------------------------------
 # Generadores
 # ----------------------------------------------------
-async def process_image(prompt_text):
+async def process_image(prompt_text, duration=0, enhance_enabled=False):
     """Generate image with Qwen. Returns local path and ComfyUI URL."""
     global base_image_name, base_image_path
 
@@ -360,7 +108,8 @@ async def process_image(prompt_text):
     with open("Qwen-Rapid-AIO.json", "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
-    workflow["3"]["inputs"]["prompt"] = prompt_text
+    workflow["17"]["inputs"]["prompt"] = prompt_text
+    workflow["17"]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
     workflow["7"]["inputs"]["image"] = base_image_name
     workflow["2"]["inputs"]["seed"] = int(uuid.uuid4().hex, 16) >> 96
 
@@ -369,6 +118,20 @@ async def process_image(prompt_text):
 
     history = requests.get(f"{COMFY_URL}/history/{prompt_id}").json()
     outputs = history.get(prompt_id, {}).get("outputs", {})
+
+    # Recuperar prompt mejorado del nodo 18
+    enhanced_prompt = None
+    try:
+        if "18" in outputs:
+            val = outputs["18"]
+            # Intentar extraer texto (formato habitual: {"string": ["texto"]} o {"text": ["texto"]})
+            if isinstance(val, dict):
+                for k in ["text", "string", "value"]:
+                    if k in val and isinstance(val[k], list) and val[k]:
+                        enhanced_prompt = val[k][0]
+                        break
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo recuperar prompt del nodo 18: {e}")
 
     expected_node = "16"
     if expected_node not in outputs:
@@ -391,10 +154,10 @@ async def process_image(prompt_text):
     # Re-upload como nueva base (Await Async version)
     await upload_to_comfy(temp_file.name)
 
-    return temp_file.name, comfy_url
+    return temp_file.name, comfy_url, enhanced_prompt
 
 
-async def process_video(prompt_text, duration=5):
+async def process_video(prompt_text, duration=5, enhance_enabled=False):
     """Generate video with LTXV. Returns local path and ComfyUI URL."""
     if not base_image_name:
         raise Exception("Se requiere imagen base")
@@ -403,9 +166,10 @@ async def process_video(prompt_text, duration=5):
         workflow = json.load(f)
 
     workflow["5180"]["inputs"]["image"] = base_image_name
-    workflow["5175"]["inputs"]["value"] = prompt_text
-    workflow["5189:5111"]["inputs"]["noise_seed"] = int(uuid.uuid4().hex, 16) % (2**32)
+    workflow["5257"]["inputs"]["value"] = prompt_text
+    workflow["5253:5189:5111"]["inputs"]["noise_seed"] = int(uuid.uuid4().hex, 16) % (2**32)
     workflow["5237"]["inputs"]["value"] = duration
+    workflow["5259"]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
 
     payload = {"prompt": workflow, "client_id": CLIENT_ID}
     response = requests.post(f"{COMFY_URL}/prompt", json=payload).json()
@@ -417,6 +181,22 @@ async def process_video(prompt_text, duration=5):
 
     node_output = await poll_until_output(prompt_id, "4958")
     logger.info("🎬 Video completed")
+
+    # Recuperar prompt mejorado del nodo 5248
+    enhanced_prompt = None
+    try:
+        history_data = requests.get(f"{COMFY_URL}/history/{prompt_id}").json()
+        outputs = history_data.get(prompt_id, {}).get("outputs", {})
+        if "5248" in outputs:
+            val = outputs["5248"]
+            # Intentar extraer texto (formato habitual: {"string": ["texto"]} o {"text": ["texto"]})
+            if isinstance(val, dict):
+                for k in ["text", "string", "value"]:
+                    if k in val and isinstance(val[k], list) and val[k]:
+                        enhanced_prompt = val[k][0]
+                        break
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo recuperar prompt del nodo 5248: {e}")
 
     output_info = (
         node_output.get("gifs", node_output.get("images", [None]))[0]
@@ -447,7 +227,7 @@ async def process_video(prompt_text, duration=5):
         f.write(resp.content)
 
     logger.info(f"Video guardado: {video_path} ({os.path.getsize(video_path)} bytes)")
-    return video_path, comfy_url
+    return video_path, comfy_url, enhanced_prompt
 
 
 GENERATORS = {
@@ -459,7 +239,7 @@ GENERATORS = {
 # ----------------------------------------------------
 # Chat function
 # ----------------------------------------------------
-async def chat_fn(message, history, mode, original_text=None, enhanced_text=None, duration=5):
+async def chat_fn(message, history, mode, original_text=None, enhanced_text=None, duration=5, enhance_enabled=False):
     """Main chat orchestrator."""
     yield history
     text = message.get("text", "")
@@ -493,7 +273,6 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
             "role": "assistant",
             "content": "⚠️ Se requiere una imagen. Sube una primero."
         })
-        save_chat_history(history)
         yield history
         return
 
@@ -508,18 +287,18 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
 
     # Show enhanced prompt immediately if available
     if enhanced_text and enhanced_text != original_text:
-        history.append({
-            "role": "assistant",
-            "content": f"✨ *Prompt mejorado:* {enhanced_text}"
-        })
-        yield history
+        # En modo video, esperamos el prompt de ComfyUI (nodo 5248), así que ocultamos el de Llama aquí
+        if mode != "video":
+            history.append({
+                "role": "assistant",
+                "content": f"✨ *Prompt mejorado:* {enhanced_text}"
+            })
+            yield history
 
     try:
         # Generate (retorna path local + URL de ComfyUI)
-        if mode == "video":
-            result_path, comfy_url = await GENERATORS[mode](text, duration)
-        else:
-            result_path, comfy_url = await GENERATORS[mode](text)
+        comfy_prompt = None
+        result_path, comfy_url, comfy_prompt = await GENERATORS[mode](text, duration, enhance_enabled)
 
         logger.info("%s OK: %s | URL: %s", mode.upper(), result_path, comfy_url)
 
@@ -532,6 +311,14 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
                 "media_type": mode
             }
         })
+
+        # Si hay prompt mejorado desde ComfyUI, agregarlo al historial
+        if comfy_prompt:
+            history.append({
+                "role": "assistant",
+                "content": f"✨ *Prompt mejorado (LTXV):* {comfy_prompt}"
+            })
+
         yield history
 
     except Exception as e:
@@ -541,8 +328,6 @@ async def chat_fn(message, history, mode, original_text=None, enhanced_text=None
             "content": f"Error procesando {mode}: {e}"
         })
         yield history
-
-    save_chat_history(history)
 
 
 # ----------------------------------------------------
@@ -568,22 +353,10 @@ async def handle_generation(message, history, auto_enhance_checked, mode, durati
     prompt_to_use = user_text
     enhanced_prompt = None
 
-    if auto_enhance_checked:
-        progress(0.1, desc="Mejorando prompt con IA...") # Progress update
-        logger.info("🤖 Auto-enhancing for %s...", mode)
-        try:
-            image_for_enhance = src_path or base_image_path
-            enhanced_prompt = await enhance_prompt_with_llama(
-                user_text, image_for_enhance, MODE_CONFIG[mode]["system_prompt"], mode
-            ) # Pass progress to enhance_prompt_with_llama
-            prompt_to_use = enhanced_prompt
-        except Exception as e:
-            logger.error("❌ Enhance failed: %s", e)
-
     progress(0.4, desc="Generando contenido con ComfyUI...") # Progress update before ComfyUI call
 
     gen_message = {"text": prompt_to_use, "files": files}
-    async for h in chat_fn(gen_message, history, mode, user_text, enhanced_prompt, duration):
+    async for h in chat_fn(gen_message, history, mode, user_text, enhanced_prompt, duration, auto_enhance_checked):
         yield h
 
     progress(1.0, desc="Generación completa.") # End
@@ -661,7 +434,6 @@ with gr.Blocks(fill_width=True, fill_height=True) as demo:
         global base_image_name, base_image_path
         base_image_name = None
         base_image_path = None
-        clear_chat_history()
         return []
 
     btn_clear.click(

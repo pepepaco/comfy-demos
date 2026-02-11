@@ -16,7 +16,7 @@ class AppConfig:
     WORKFLOW_CONFIG = {
         "prompt_node_id": "3",
         "image_node_id": "7",
-        "output_node_id": "6"
+        "output_node_id": "16"
     }
 
 

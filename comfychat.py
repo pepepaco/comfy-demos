@@ -107,6 +107,12 @@ async def upload_to_comfy(file_path):
     logger.info(f"📤 Uploaded to ComfyUI: {base_image_name}")
     return base_image_name
 
+def find_node_id(workflow, title):
+    """Busca el ID de un nodo por su título en _meta."""
+    for node_id, node in workflow.items():
+        if node.get("_meta", {}).get("title") == title:
+            return node_id
+    return None
 
 async def submit_and_wait(workflow):
     payload = {"prompt": workflow, "client_id": CLIENT_ID}
@@ -177,10 +183,15 @@ async def process_image(prompt_text, duration=0, enhance_enabled=False, progress
     with open("Qwen-Rapid-AIO.json", "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
-    workflow["17"]["inputs"]["prompt"] = prompt_text
-    workflow["17"]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
-    workflow["7"]["inputs"]["image"] = base_image_name
-    workflow["2"]["inputs"]["seed"] = int(uuid.uuid4().hex, 16) >> 96
+    # Usar find_node_id para no depender de IDs fijos
+    openai_id = find_node_id(workflow, "OpenAICompat")
+    workflow[openai_id]["inputs"]["prompt"] = prompt_text
+    workflow[openai_id]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
+
+    workflow[find_node_id(workflow, "Optional Input Image")]["inputs"]["image"] = base_image_name
+    workflow[find_node_id(workflow, "KSampler")]["inputs"]["seed"] = int(uuid.uuid4().hex, 16) >> 96
+
+    output_node_id = find_node_id(workflow, "Save Image for Chat")
 
     if progress_cb:
         progress_cb(0.15, desc="Enviando a ComfyUI...")
@@ -189,7 +200,7 @@ async def process_image(prompt_text, duration=0, enhance_enabled=False, progress
     logger.info("🟢 Image prompt: %s", prompt_id)
 
     # Esperar con polling y progreso continuo
-    await poll_until_output(prompt_id, "16", timeout_secs=300, progress_cb=progress_cb)
+    await poll_until_output(prompt_id, output_node_id, timeout_secs=300, progress_cb=progress_cb)
 
     if progress_cb:
         progress_cb(0.95, desc="Recuperando imagen...")
@@ -198,9 +209,10 @@ async def process_image(prompt_text, duration=0, enhance_enabled=False, progress
     outputs = history.get(prompt_id, {}).get("outputs", {})
 
     enhanced_prompt = None
+    preview_id = find_node_id(workflow, "Preview as Text")
     try:
-        if "18" in outputs:
-            val = outputs["18"]
+        if preview_id and preview_id in outputs:
+            val = outputs[preview_id]
             if isinstance(val, dict):
                 for k in ["text", "string", "value"]:
                     if k in val and isinstance(val[k], list) and val[k]:
@@ -209,10 +221,10 @@ async def process_image(prompt_text, duration=0, enhance_enabled=False, progress
     except Exception as e:
         logger.warning(f"⚠️ No se pudo recuperar prompt del nodo 18: {e}")
 
-    if "16" not in outputs:
-        raise Exception(f"No output en nodo 16: {list(outputs.keys())}")
+    if output_node_id not in outputs:
+        raise Exception(f"No output en nodo {output_node_id}: {list(outputs.keys())}")
 
-    info = outputs["16"]["images"][0]
+    info = outputs[output_node_id]["images"][0]
     comfy_url = f"{COMFY_URL}/view?filename={info['filename']}&type={info['type']}"
     logger.info(f"🖼️ Image URL: {comfy_url}")
 
@@ -239,11 +251,15 @@ async def process_video(prompt_text, duration=5, enhance_enabled=False, progress
     with open("LTXV-DoAlmostEverything-v3.json", "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
-    workflow["5180"]["inputs"]["image"] = base_image_name
-    workflow["5257"]["inputs"]["value"] = prompt_text
-    workflow["5253:5189:5111"]["inputs"]["noise_seed"] = int(uuid.uuid4().hex, 16) % (2**32)
-    workflow["5237"]["inputs"]["value"] = duration
-    workflow["5259"]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
+    workflow[find_node_id(workflow, "Load Image")]["inputs"]["image"] = base_image_name
+    openai_id = find_node_id(workflow, "OpenAICompat")
+    workflow[openai_id]["inputs"]["prompt"] = prompt_text
+    workflow[openai_id]["inputs"]["bypass"] = 'false' if enhance_enabled else 'true'
+
+    workflow[find_node_id(workflow, "RandomNoise")]["inputs"]["noise_seed"] = int(uuid.uuid4().hex, 16) % (2**32)
+    workflow[find_node_id(workflow, "Duration")]["inputs"]["value"] = duration
+
+    output_node_id = find_node_id(workflow, "Save Video")
 
     if progress_cb:
         progress_cb(0.15, desc="Enviando a ComfyUI...")
@@ -258,7 +274,7 @@ async def process_video(prompt_text, duration=5, enhance_enabled=False, progress
 
     # Esperar con polling y progreso continuo
     node_output = await poll_until_output(
-        prompt_id, "4958", timeout_secs=600, progress_cb=progress_cb
+        prompt_id, output_node_id, timeout_secs=600, progress_cb=progress_cb
     )
     logger.info("🎬 Video completed")
 
@@ -266,11 +282,12 @@ async def process_video(prompt_text, duration=5, enhance_enabled=False, progress
         progress_cb(0.96, desc="Recuperando prompt mejorado...")
 
     enhanced_prompt = None
+    preview_id = find_node_id(workflow, "Preview as Text")
     try:
         history_data = requests.get(f"{COMFY_URL}/history/{prompt_id}").json()
         out = history_data.get(prompt_id, {}).get("outputs", {})
-        if "5248" in out:
-            val = out["5248"]
+        if preview_id and preview_id in out:
+            val = out[preview_id]
             if isinstance(val, dict):
                 for k in ["text", "string", "value"]:
                     if k in val and isinstance(val[k], list) and val[k]:
